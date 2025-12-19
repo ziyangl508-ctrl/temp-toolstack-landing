@@ -1,13 +1,192 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <meta name="viewport" ontent="width=device-width, initial-scale=1.0" />
-    <title>Toolstack.run</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hand Tracking Particle Model</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; }
+        #video-container { position: absolute; bottom: 10px; right: 10px; width: 200px; border: 2px solid #444; }
+        video { width: 100%; transform: scaleX(-1); }
+        canvas { display: block; }
+        #loading { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; font-family: sans-serif; }
+    </style>
+</head>
+<body>
+
+<div id="loading">Loading Model & AI...</div>
+<div id="video-container"><video id="input_video"></video></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { MeshSurfaceSampler } from 'three/addons/math/MeshSurfaceSampler.js';
+
+// --- 全局变量 ---
+let scene, camera, renderer, particles, sampler;
+let originalPoints = []; // 存储粒子的初始位置
+let targetExpansion = 0;  // 0 到 1 的扩散程度
+let currentExpansion = 0;
+const particleCount = 15000; // 粒子数量
+
+const videoElement = document.getElementById('input_video');
+
+// --- 1. 初始化 Three.js 场景 ---
+function initScene() {
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.z = 3;
+
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    document.body.appendChild(renderer.domElement);
+
+    const light = new THREE.PointLight(0xffffff, 1);
+    scene.add(new THREE.AmbientLight(0x404040));
+    camera.add(light);
+    scene.add(camera);
+}
+
+// --- 2. 加载模型并转换为粒子 ---
+function loadModel() {
+    const loader = new GLTFLoader();
+    // 注意：这里替换为你上传的 65df4b8f-a95a-467c-a97b-46cb04abe842.glb 路径
+    loader.load('65df4b8f-a95a-467c-a97b-46cb04abe842.glb', (gltf) => {
+        const mesh = gltf.scene.children[0].children[0] || gltf.scene.children[0];
+        
+        // 创建采样器
+        sampler = new MeshSurfaceSampler(mesh).build();
+        
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(particleCount * 3);
+        
+        const tempPosition = new THREE.Vector3();
+        for (let i = 0; i < particleCount; i++) {
+            sampler.sample(tempPosition);
+            positions[i * 3] = tempPosition.x;
+            positions[i * 3 + 1] = tempPosition.y;
+            positions[i * 3 + 2] = tempPosition.z;
+            originalPoints.push(new THREE.Vector3(tempPosition.x, tempPosition.y, tempPosition.z));
+        }
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+        // 蓝色圆形材质
+        const material = new THREE.PointsMaterial({
+            color: 0x00aaff,
+            size: 0.015,
+            transparent: true,
+            opacity: 0.8,
+            blending: THREE.AdditiveBlending,
+            sizeAttenuation: true
+        });
+
+        particles = new THREE.Points(geometry, material);
+        scene.add(particles);
+        
+        document.getElementById('loading').style.display = 'none';
+        animate();
+    });
+}
+
+// --- 3. 初始化 MediaPipe ---
+function initMediaPipe() {
+    const hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+
+    hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+
+    hands.onResults(onResults);
+
+    const cameraUtils = new Camera(videoElement, {
+        onFrame: async () => {
+            await hands.send({ image: videoElement });
+        },
+        width: 640,
+        height: 480
+    });
+    cameraUtils.start();
+}
+
+// 手势识别逻辑
+function onResults(results) {
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+        const landmarks = results.multiHandLandmarks[0];
+        
+        // 计算大拇指指尖(4)和食指指尖(8)的距离
+        const thumb = landmarks[4];
+        const index = landmarks[8];
+        const distance = Math.sqrt(
+            Math.pow(thumb.x - index.x, 2) + 
+            Math.pow(thumb.y - index.y, 2)
+        );
+
+        // 映射距离：通常 0.05 是捏合，0.2 以上是张开
+        targetExpansion = THREE.MathUtils.clamp((distance - 0.05) * 5, 0, 1.5);
+    } else {
+        targetExpansion = 0; // 无手时收缩
+    }
+}
+
+// --- 4. 动画循环 ---
+function animate() {
+    requestAnimationFrame(animate);
+
+    // 平滑过渡
+    currentExpansion = THREE.MathUtils.lerp(currentExpansion, targetExpansion, 0.1);
+
+    if (particles) {
+        const positions = particles.geometry.attributes.position.array;
+        
+        // 旋转模型
+        particles.rotation.y += 0.005 + (currentExpansion * 0.05);
+
+        // 粒子扩散逻辑
+        for (let i = 0; i < particleCount; i++) {
+            const i3 = i * 3;
+            const orig = originalPoints[i];
+            
+            // 沿法线或中心向外推（简单处理：沿坐标轴向外扩散）
+            positions[i3] = orig.x * (1 + currentExpansion);
+            positions[i3 + 1] = orig.y * (1 + currentExpansion);
+            positions[i3 + 2] = orig.z * (1 + currentExpansion);
+        }
+        particles.geometry.attributes.position.needsUpdate = true;
+    }
+
+    renderer.render(scene, camera);
+}
+
+// 窗口自适应
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// 启动
+initScene();
+loadModel();
+initMediaPipe();
+</script>
+</body>
 </html>
